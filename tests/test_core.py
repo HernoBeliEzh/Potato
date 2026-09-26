@@ -3,12 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from potato.api import Module, command, interval, on_message, webhook
+from potato.__main__ import login
 from potato.application import AccountRuntime
 from potato.manager import ModuleManager
 from potato.releases import ModuleValidationError, ReleaseManager, inspect_module
@@ -380,6 +381,59 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         response = await self.manager.handle_webhook(request)
         self.assertEqual(response.status, 200)
         self.assertEqual(response.text, '{"received": true}')
+
+
+class LoginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qr_login_refreshes_expired_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings("default", 1, "hash", Path(directory), "127.0.0.1", 8080, "")
+            client = AsyncMock()
+            client.is_user_authorized.return_value = False
+            client.get_me.return_value = SimpleNamespace(id=100)
+            qr_login = AsyncMock()
+            qr_login.url = "tg://login?token=first"
+            qr_login.wait.side_effect = [asyncio.TimeoutError(), SimpleNamespace(id=100)]
+
+            async def recreate():
+                qr_login.url = "tg://login?token=second"
+
+            qr_login.recreate.side_effect = recreate
+            client.qr_login.return_value = qr_login
+            with (
+                patch("telethon.TelegramClient", return_value=client),
+                patch("qrcode.QRCode") as qr_code,
+                patch("builtins.print"),
+            ):
+                await login(settings, qr=True)
+
+            self.assertEqual(qr_code.return_value.add_data.call_count, 2)
+            qr_code.return_value.add_data.assert_any_call("tg://login?token=first")
+            qr_code.return_value.add_data.assert_any_call("tg://login?token=second")
+            qr_login.recreate.assert_awaited_once()
+            client.disconnect.assert_awaited_once()
+
+    async def test_qr_login_accepts_two_factor_password(self):
+        from telethon.errors import SessionPasswordNeededError
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings("default", 1, "hash", Path(directory), "127.0.0.1", 8080, "")
+            client = AsyncMock()
+            client.is_user_authorized.return_value = False
+            client.get_me.return_value = SimpleNamespace(id=100)
+            qr_login = AsyncMock()
+            qr_login.url = "tg://login?token=first"
+            qr_login.wait.side_effect = SessionPasswordNeededError(None)
+            client.qr_login.return_value = qr_login
+            with (
+                patch("telethon.TelegramClient", return_value=client),
+                patch("qrcode.QRCode"),
+                patch("builtins.print"),
+                patch("potato.__main__.getpass.getpass", return_value="password"),
+            ):
+                await login(settings, qr=True)
+
+            client.sign_in.assert_awaited_once_with(password="password")
+            client.disconnect.assert_awaited_once()
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
