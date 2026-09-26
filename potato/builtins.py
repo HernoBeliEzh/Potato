@@ -1,16 +1,39 @@
 from __future__ import annotations
 
+import secrets
 import time
+
+from telethon import functions
 
 from potato.api import Module, command
 from potato.releases import ModuleValidationError
 
 
-class SystemModule(Module):
+class PotatoHelp(Module):
     @command("help")
     async def help(self, event) -> None:
-        names = ", ".join(f".{name}" for name in sorted(self.context.manager.commands))
-        await event.reply(f"Команды Potato: {names}")
+        manager = self.context.manager
+        lines = [f"{len(manager.modules)} модулей активно:", ""]
+        for identifier, module in sorted(
+            manager.modules.items(), key=lambda item: type(item[1]).__name__.casefold()
+        ):
+            names = sorted(
+                name for name, handler in manager.commands.items() if handler.module == identifier
+            )
+            commands = " | ".join(names) if names else "без команд"
+            lines.append(f"▪️ {type(module).__name__}: ( {commands} )")
+        message = "\n".join(lines)
+        while message:
+            chunk = message[:3900]
+            if len(message) > 3900:
+                boundary = chunk.rfind("\n")
+                if boundary > 0:
+                    chunk = chunk[:boundary]
+            await event.reply(chunk)
+            message = message[len(chunk):].lstrip("\n")
+
+
+class PotatoInfo(Module):
 
     @command("status")
     async def status(self, event) -> None:
@@ -47,7 +70,7 @@ class SystemModule(Module):
         await event.reply("Вебхуки:\n" + "\n".join(routes) if routes else "Вебхуков пока нет.")
 
 
-class ModuleAdmin(Module):
+class PotatoLoader(Module):
     @command("lm")
     async def load_module(self, event) -> None:
         reply = await event.get_reply_message()
@@ -81,3 +104,18 @@ class ModuleAdmin(Module):
     async def restart(self, event) -> None:
         await event.reply("Potato перезапускается.")
         self.context.request_restart()
+
+
+class PotatoTester(Module):
+    @command("ping")
+    async def ping(self, event) -> None:
+        started = time.perf_counter()
+        await self.context.client(functions.PingRequest(ping_id=secrets.randbits(63)))
+        latency = (time.perf_counter() - started) * 1000
+        uptime = int(time.monotonic() - self.context.manager.started_at)
+        hours, remainder = divmod(uptime, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        await event.reply(
+            f"Пинг Telegram: {latency:.0f} мс\n"
+            f"Время работы: {hours:02d}:{minutes:02d}:{seconds:02d}"
+        )

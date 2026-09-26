@@ -84,10 +84,12 @@ class ModuleManager:
         self.failures: list[str] = []
 
     async def load_all(self) -> None:
-        from potato.builtins import ModuleAdmin, SystemModule
+        from potato.builtins import PotatoHelp, PotatoInfo, PotatoLoader, PotatoTester
 
-        await self._load_class("system", SystemModule)
-        await self._load_class("module_admin", ModuleAdmin)
+        await self._load_class("potato_help", PotatoHelp)
+        await self._load_class("system", PotatoInfo)
+        await self._load_class("module_admin", PotatoLoader)
+        await self._load_class("potato_tester", PotatoTester)
         active = self.releases.active_modules()
         if active is None:
             return

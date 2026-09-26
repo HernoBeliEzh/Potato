@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
+from telethon import functions
 
 from potato.api import Module, command, interval, on_message, webhook
 from potato.__main__ import login
@@ -26,7 +27,12 @@ class FakeClient:
         self.connected = False
         self.handlers = []
         self.messages = []
+        self.requests = []
         self.disconnection = asyncio.Event()
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        return SimpleNamespace()
 
     async def download_media(self, message, file):
         return self.downloaded
@@ -227,6 +233,35 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         outgoing = FakeEvent(".STATUS", None)
         await self.manager.dispatch_message(outgoing)
         self.assertIn("Potato работает", outgoing.replies[0])
+
+    async def test_ping_measures_telegram_and_uptime(self):
+        event = FakeEvent(". PiNg", 100)
+        await self.manager.dispatch_message(event)
+        self.assertIsInstance(self.client.requests[0], functions.PingRequest)
+        self.assertRegex(event.replies[0], r"Пинг Telegram: \d+ мс")
+        self.assertRegex(event.replies[0], r"Время работы: \d{2}:\d{2}:\d{2}")
+
+    async def test_help_groups_loaded_modules_and_commands(self):
+        class Tasks(Module):
+            @command("work")
+            async def work(self, event):
+                await event.reply("done")
+
+        class Watcher(Module):
+            @on_message(incoming=True)
+            async def watch(self, event):
+                await event.reply("seen")
+
+        await self.manager._load_class("tasks", Tasks)
+        await self.manager._load_class("watcher", Watcher)
+        event = FakeEvent(". HELP", 100)
+        await self.manager.dispatch_message(event)
+        response = "\n".join(event.replies)
+        self.assertIn("6 модулей активно:", response)
+        self.assertIn("▪️ PotatoHelp: ( help )", response)
+        self.assertIn("▪️ PotatoTester: ( ping )", response)
+        self.assertIn("▪️ Tasks: ( work )", response)
+        self.assertIn("▪️ Watcher: ( без команд )", response)
 
     async def test_lm_stages_file_until_restart(self):
         reply = SimpleNamespace(

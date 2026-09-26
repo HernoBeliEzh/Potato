@@ -20,7 +20,7 @@ from potato import API_VERSION
 
 MAX_MODULE_SIZE = 1_048_576
 MODULE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\.py\Z")
-RESERVED_MODULES = {"system", "module_admin"}
+RESERVED_MODULES = {"system", "module_admin", "potato_help", "potato_tester"}
 
 
 @dataclass(frozen=True)
