@@ -71,9 +71,14 @@ class FakeEvent:
         self.chat_id = sender_id
         self.reply_message = reply_message
         self.replies = []
+        self.edits = []
 
     async def reply(self, text):
         self.replies.append(text)
+
+    async def edit(self, text):
+        self.edits.append(text)
+        self.raw_text = text
 
     async def get_reply_message(self):
         return self.reply_message
@@ -238,8 +243,10 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(". PiNg", 100)
         await self.manager.dispatch_message(event)
         self.assertIsInstance(self.client.requests[0], functions.PingRequest)
-        self.assertRegex(event.replies[0], r"Пинг Telegram: \d+ мс")
-        self.assertRegex(event.replies[0], r"Время работы: \d{2}:\d{2}:\d{2}")
+        self.assertEqual(event.replies, [])
+        self.assertEqual(len(event.edits), 1)
+        self.assertRegex(event.edits[0], r"Пинг Telegram: \d+ мс")
+        self.assertRegex(event.edits[0], r"Время работы: \d{2}:\d{2}:\d{2}")
 
     async def test_help_groups_loaded_modules_and_commands(self):
         class Tasks(Module):

@@ -115,7 +115,7 @@ class PotatoTester(Module):
         uptime = int(time.monotonic() - self.context.manager.started_at)
         hours, remainder = divmod(uptime, 3600)
         minutes, seconds = divmod(remainder, 60)
-        await event.reply(
+        await event.edit(
             f"Пинг Telegram: {latency:.0f} мс\n"
             f"Время работы: {hours:02d}:{minutes:02d}:{seconds:02d}"
         )
