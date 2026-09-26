@@ -1,0 +1,23 @@
+services:
+  potato:
+    build: .
+    env_file: .env
+    init: true
+    restart: unless-stopped
+    volumes:
+      - potato_data:/data
+    ports:
+      - "127.0.0.1:${POTATO_BIND_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  potato_data:
