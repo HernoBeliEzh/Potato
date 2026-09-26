@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 class CommandSpec:
     name: str
     owner_only: bool
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -55,9 +56,9 @@ class Module:
         self.context = context
 
 
-def command(name: str, *, owner_only: bool = True):
+def command(name: str, *, owner_only: bool = True, aliases: tuple[str, ...] = ()):
     def decorate(callback):
-        callback.__potato_command__ = CommandSpec(name, owner_only)
+        callback.__potato_command__ = CommandSpec(name, owner_only, aliases)
         return callback
 
     return decorate

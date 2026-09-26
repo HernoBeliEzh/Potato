@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from urllib.parse import urlparse
 
 from telethon import functions
 
@@ -21,40 +22,91 @@ class PotatoHelp(Module):
     @command("help")
     async def help(self, event) -> None:
         manager = self.context.manager
-        header = (
-            f"{CUSTOM_EMOJI} <b>Potato · справка</b>\n"
-            f"<i>{len(manager.modules)} модулей активно · {len(manager.commands)} команд</i>"
-        )
-        blocks = []
+        hidden = set(await self.context.storage.get("hidden_modules", []))
+        lines = []
         for identifier, module in sorted(
             manager.modules.items(), key=lambda item: type(item[1]).__name__.casefold()
         ):
+            if identifier in hidden:
+                continue
             names = sorted(
                 name for name, handler in manager.commands.items() if handler.module == identifier
             )
-            fragments = [f"<code>.{safe(name)}</code>" for name in names] or [
-                "<i>без команд</i>"
-            ]
-            label = f"▪️ <b>{safe(type(module).__name__)}</b>"
+            label = f"▪️ <b>{safe(type(module).__name__)}:</b>"
             current = []
-            for fragment in fragments:
-                if current and len(" | ".join((*current, fragment))) > 3000:
-                    blocks.append(f"<blockquote>{label}\n{' | '.join(current)}</blockquote>")
+            for name in names or ["без команд"]:
+                fragment = safe(name)
+                if current and len(label) + len(" | ".join((*current, fragment))) > 3000:
+                    lines.append(f"{label} ( {' | '.join(current)} )")
                     current = []
                 current.append(fragment)
-            blocks.append(f"<blockquote>{label}\n{' | '.join(current)}</blockquote>")
+            lines.append(f"{label} ( {' | '.join(current)} )")
 
-        page = header
-        for block in blocks:
-            if len(page) + len(block) + 2 > 3800:
-                await send_html(event, page)
-                page = "🧩 <b>Potato · справка</b> <i>(продолжение)</i>"
-            page = f"{page}\n\n{block}"
-        await send_html(event, page)
+        pages = []
+        current = []
+        for line in lines:
+            header = (
+                f"<b>{len(manager.modules)} модулей активно:</b>"
+                if not pages else "<b>Potato · справка</b> <i>(продолжение)</i>"
+            )
+            if current and len(header) + len("\n".join((*current, line))) + 31 > 3800:
+                pages.append(current)
+                current = []
+            current.append(line)
+        pages.append(current)
+        for index, page in enumerate(pages):
+            header = (
+                f"<b>{len(manager.modules)} модулей активно:</b>"
+                if index == 0 else "<b>Potato · справка</b> <i>(продолжение)</i>"
+            )
+            await send_html(event, f"{header}\n\n<blockquote>{'\n'.join(page)}</blockquote>", edit=index == 0 and event.out)
+
+    @command("helphide")
+    async def hide(self, event) -> None:
+        parts = event.raw_text[1:].split(maxsplit=1)
+        if len(parts) < 2:
+            await send_html(event, "🧩 <b>Скрыть модуль из справки</b>\n<blockquote>Используйте <code>.helphide имя_модуля</code>.</blockquote>")
+            return
+        target = parts[1].strip().casefold()
+        manager = self.context.manager
+        matches = [
+            identifier for identifier, module in manager.modules.items()
+            if target in {identifier.casefold(), type(module).__name__.casefold()}
+        ]
+        if not matches:
+            await send_html(event, "⚠️ <b>Модуль не найден.</b>")
+            return
+        identifier = matches[0]
+        if identifier == "potato_help":
+            await send_html(event, "⚠️ <b>Модуль справки нельзя скрыть.</b>")
+            return
+        hidden = set(await self.context.storage.get("hidden_modules", []))
+        if identifier in hidden:
+            hidden.remove(identifier)
+            action = "снова отображается"
+        else:
+            hidden.add(identifier)
+            action = "скрыт из справки"
+        await self.context.storage.set("hidden_modules", sorted(hidden))
+        await send_html(event, f"🧩 <b>{safe(type(manager.modules[identifier]).__name__)}</b> {action}.")
+
+    @command("support")
+    async def support(self, event) -> None:
+        source = self.context.source_url
+        parsed = urlparse(source)
+        if parsed.hostname == "github.com" and len(parsed.path.strip("/").split("/")) >= 2:
+            project = "/".join(parsed.path.strip("/").split("/")[:2])
+            address = f"https://github.com/{project}/issues"
+        else:
+            address = source
+        if address:
+            await send_html(event, f"💬 <b>Поддержка Potato</b>\n<blockquote>{safe(address)}</blockquote>")
+        else:
+            await send_html(event, "⚠️ <i>Адрес поддержки не настроен владельцем.</i>")
 
 
 class PotatoInfo(Module):
-    @command("status")
+    @command("status", aliases=("info", "ubinfo"))
     async def status(self, event) -> None:
         manager = self.context.manager
         await send_html(
@@ -106,7 +158,7 @@ class PotatoInfo(Module):
 
 
 class PotatoLoader(Module):
-    @command("lm")
+    @command("lm", aliases=("ml",))
     async def load_module(self, event) -> None:
         reply = await event.get_reply_message()
         if reply is None or reply.document is None or reply.file is None:
@@ -160,5 +212,4 @@ class PotatoTester(Module):
             event,
             f"{CUSTOM_EMOJI} <b>Пинг Telegram:</b> <code>{latency:.0f} мс</code>\n"
             f"⏱ <i>Время работы:</i> <code>{uptime_text(self.context.manager.started_at)}</code>",
-            edit=True,
         )

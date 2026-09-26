@@ -6,8 +6,8 @@ from telethon.errors import DocumentInvalidError, PremiumAccountRequiredError
 CUSTOM_EMOJI = '<tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>'
 
 
-async def send_html(event, message: str, *, edit: bool = False):
-    send = event.edit if edit else event.reply
+async def send_html(event, message: str, *, edit: bool | None = None):
+    send = event.edit if (event.out if edit is None else edit) else event.reply
     try:
         return await send(message, parse_mode="html")
     except (DocumentInvalidError, PremiumAccountRequiredError):

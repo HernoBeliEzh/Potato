@@ -134,16 +134,17 @@ class ModuleManager:
                 raise TypeError("Module handlers must be async")
 
             if command_spec is not None:
-                name = command_spec.name.casefold()
-                valid_name = (
-                    1 <= len(name) <= 64
-                    and name[0].isalpha()
-                    and all(character.isalnum() or character in "_-" for character in name[1:])
-                )
-                if not valid_name or name in self.commands or name in new_commands:
-                    raise ValueError(f"Invalid or duplicate command: {name}")
+                for name in (command_spec.name, *command_spec.aliases):
+                    normalized = name.casefold()
+                    valid_name = (
+                        1 <= len(normalized) <= 64
+                        and normalized[0].isalpha()
+                        and all(character.isalnum() or character in "_-" for character in normalized[1:])
+                    )
+                    if not valid_name or normalized in self.commands or normalized in new_commands:
+                        raise ValueError(f"Invalid or duplicate command: {normalized}")
+                    new_commands.add(normalized)
                 commands.append(CommandHandler(identifier, callback, command_spec))
-                new_commands.add(name)
 
             if message_spec is not None:
                 if not message_spec.incoming and not message_spec.outgoing:
@@ -189,7 +190,8 @@ class ModuleManager:
 
         self.modules[identifier] = instance
         for handler in commands:
-            self.commands[handler.spec.name.casefold()] = handler
+            for name in (handler.spec.name, *handler.spec.aliases):
+                self.commands[name.casefold()] = handler
         self.messages.extend(messages)
         for handler in webhooks:
             for method in handler.spec.methods:

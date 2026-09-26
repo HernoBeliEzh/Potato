@@ -246,11 +246,11 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
         owner = FakeEvent(". StAtUs", 100)
         await self.manager.dispatch_message(owner)
-        self.assertIn("Potato работает", owner.replies[0])
+        self.assertIn("Potato работает", owner.edits[0])
 
         outgoing = FakeEvent(".STATUS", None)
         await self.manager.dispatch_message(outgoing)
-        self.assertIn("Potato работает", outgoing.replies[0])
+        self.assertIn("Potato работает", outgoing.edits[0])
 
     async def test_ping_measures_telegram_and_uptime(self):
         event = FakeEvent(". PiNg", 100)
@@ -281,16 +281,30 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager._load_class("watcher", Watcher)
         event = FakeEvent(". HELP", 100)
         await self.manager.dispatch_message(event)
-        response = "\n".join(telegram_html.parse(reply)[0] for reply in event.replies)
+        response = "\n".join(telegram_html.parse(reply)[0] for reply in event.edits + event.replies)
         self.assertIn("6 модулей активно", response)
-        self.assertIn("▪️ PotatoHelp\n.help", response)
-        self.assertIn("▪️ PotatoTester\n.ping", response)
-        self.assertIn("▪️ Tasks\n.work", response)
-        self.assertIn("▪️ Watcher\nбез команд", response)
+        self.assertIn("▪️ PotatoHelp: ( help | helphide | support )", response)
+        self.assertIn("▪️ PotatoTester: ( ping )", response)
+        self.assertIn("▪️ Tasks: ( work )", response)
+        self.assertIn("▪️ Watcher: ( без команд )", response)
+        self.assertEqual(event.replies, [])
+        self.assertTrue(all(options == {"parse_mode": "html"} for options in event.edit_options))
         self.assertTrue(all(options == {"parse_mode": "html"} for options in event.reply_options))
-        entities = [entity for reply in event.replies for entity in telegram_html.parse(reply)[1]]
+        entities = [entity for reply in event.edits + event.replies for entity in telegram_html.parse(reply)[1]]
         self.assertTrue(any(isinstance(entity, MessageEntityBlockquote) for entity in entities))
-        self.assertTrue(any(isinstance(entity, MessageEntityCustomEmoji) for entity in entities))
+        self.assertTrue(any(isinstance(entity, MessageEntityBold) for entity in entities))
+
+    async def test_helphide_changes_visible_modules_without_unloading_them(self):
+        await self.manager.dispatch_message(FakeEvent(".helphide PotatoTester", 100))
+        hidden = FakeEvent(".help", 100)
+        await self.manager.dispatch_message(hidden)
+        self.assertNotIn("PotatoTester", hidden.edits[0])
+        self.assertIn("potato_tester", self.manager.modules)
+
+        await self.manager.dispatch_message(FakeEvent(".helphide potato_tester", 100))
+        visible = FakeEvent(".help", 100)
+        await self.manager.dispatch_message(visible)
+        self.assertIn("PotatoTester", visible.edits[0])
 
     async def test_help_keeps_long_html_pages_complete(self):
         handler = self.manager.commands["status"]
@@ -299,15 +313,16 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
         event = FakeEvent(".help", 100)
         await self.manager.dispatch_message(event)
-        self.assertGreater(len(event.replies), 1)
-        self.assertTrue(all(len(reply) <= 3800 for reply in event.replies))
-        rendered = "\n".join(telegram_html.parse(reply)[0] for reply in event.replies)
-        self.assertIn(".long_command_000_", rendered)
-        self.assertIn(".long_command_119_", rendered)
+        self.assertGreater(len(event.edits + event.replies), 1)
+        self.assertEqual(len(event.edits), 1)
+        self.assertTrue(all(len(reply) <= 3800 for reply in event.edits + event.replies))
+        rendered = "\n".join(telegram_html.parse(reply)[0] for reply in event.edits + event.replies)
+        self.assertIn("long_command_000_", rendered)
+        self.assertIn("long_command_119_", rendered)
         self.assertTrue(
             all(
                 any(isinstance(entity, MessageEntityBlockquote) for entity in telegram_html.parse(reply)[1])
-                for reply in event.replies
+                for reply in event.edits + event.replies
             )
         )
 
@@ -319,7 +334,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.dispatch_message(command_event)
         self.assertTrue((self.releases.pending / "example.py").exists())
         self.assertNotIn("example", self.manager.modules)
-        self.assertIn(".restart", command_event.replies[0])
+        self.assertIn(".restart", command_event.edits[0])
 
         await self.manager.dispatch_message(FakeEvent(". ReStArT", 100))
         self.assertTrue(self.shutdown.is_set())
@@ -360,6 +375,27 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager._load_class("first", First)
         with self.assertRaises(ValueError):
             await self.manager._load_class("second", Second)
+
+    async def test_command_aliases_are_registered_and_validated(self):
+        seen = []
+
+        class Aliased(Module):
+            @command("primary", aliases=("other",))
+            async def run(self, event):
+                seen.append(event.raw_text)
+
+        await self.manager._load_class("aliased", Aliased)
+        await self.manager.dispatch_message(FakeEvent(". OTHER", 100))
+        self.assertEqual(seen, [". OTHER"])
+        self.assertEqual(self.manager.commands["primary"], self.manager.commands["other"])
+
+        class Duplicate(Module):
+            @command("another", aliases=("OTHER",))
+            async def run(self, event):
+                await event.reply("duplicate")
+
+        with self.assertRaises(ValueError):
+            await self.manager._load_class("duplicate", Duplicate)
 
     async def test_dispatches_messages_tasks_and_webhooks(self):
         seen = []
@@ -471,14 +507,14 @@ class PresentationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(".help", 100)
         with patch.object(
             event,
-            "reply",
+            "edit",
             side_effect=[PremiumAccountRequiredError(None), None],
-        ) as reply:
+        ) as edit:
             await send_html(event, f"{CUSTOM_EMOJI} <b>Potato</b>")
 
-        self.assertEqual(reply.await_count, 2)
-        self.assertNotIn("tg-emoji", reply.await_args_list[1].args[0])
-        self.assertEqual(reply.await_args_list[1].kwargs, {"parse_mode": "html"})
+        self.assertEqual(edit.await_count, 2)
+        self.assertNotIn("tg-emoji", edit.await_args_list[1].args[0])
+        self.assertEqual(edit.await_args_list[1].kwargs, {"parse_mode": "html"})
 
     async def test_dynamic_text_is_escaped(self):
         self.assertEqual(safe('<script attr="x">&'), "&lt;script attr=&quot;x&quot;&gt;&amp;")
