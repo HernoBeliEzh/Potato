@@ -8,11 +8,20 @@ from unittest.mock import AsyncMock, patch
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 from telethon import functions
+from telethon.errors import PremiumAccountRequiredError
+from telethon.extensions import html as telegram_html
+from telethon.tl.types import (
+    MessageEntityBlockquote,
+    MessageEntityBold,
+    MessageEntityCustomEmoji,
+    MessageEntityItalic,
+)
 
 from potato.api import Module, command, interval, on_message, webhook
 from potato.__main__ import login
 from potato.application import AccountRuntime
 from potato.manager import ModuleManager
+from potato.presentation import CUSTOM_EMOJI, safe, send_html
 from potato.releases import ModuleValidationError, ReleaseManager, inspect_module
 from potato.settings import Settings
 from potato.storage import Storage
@@ -72,12 +81,16 @@ class FakeEvent:
         self.reply_message = reply_message
         self.replies = []
         self.edits = []
+        self.reply_options = []
+        self.edit_options = []
 
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         self.replies.append(text)
+        self.reply_options.append(kwargs)
 
-    async def edit(self, text):
+    async def edit(self, text, **kwargs):
         self.edits.append(text)
+        self.edit_options.append(kwargs)
         self.raw_text = text
 
     async def get_reply_message(self):
@@ -245,8 +258,13 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.client.requests[0], functions.PingRequest)
         self.assertEqual(event.replies, [])
         self.assertEqual(len(event.edits), 1)
-        self.assertRegex(event.edits[0], r"Пинг Telegram: \d+ мс")
-        self.assertRegex(event.edits[0], r"Время работы: \d{2}:\d{2}:\d{2}")
+        self.assertEqual(event.edit_options[0], {"parse_mode": "html"})
+        rendered, entities = telegram_html.parse(event.edits[0])
+        self.assertRegex(rendered, r"Пинг Telegram: \d+ мс")
+        self.assertRegex(rendered, r"Время работы: \d{2}:\d{2}:\d{2}")
+        self.assertTrue(any(isinstance(entity, MessageEntityCustomEmoji) for entity in entities))
+        self.assertTrue(any(isinstance(entity, MessageEntityBold) for entity in entities))
+        self.assertTrue(any(isinstance(entity, MessageEntityItalic) for entity in entities))
 
     async def test_help_groups_loaded_modules_and_commands(self):
         class Tasks(Module):
@@ -263,12 +281,35 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager._load_class("watcher", Watcher)
         event = FakeEvent(". HELP", 100)
         await self.manager.dispatch_message(event)
-        response = "\n".join(event.replies)
-        self.assertIn("6 модулей активно:", response)
-        self.assertIn("▪️ PotatoHelp: ( help )", response)
-        self.assertIn("▪️ PotatoTester: ( ping )", response)
-        self.assertIn("▪️ Tasks: ( work )", response)
-        self.assertIn("▪️ Watcher: ( без команд )", response)
+        response = "\n".join(telegram_html.parse(reply)[0] for reply in event.replies)
+        self.assertIn("6 модулей активно", response)
+        self.assertIn("▪️ PotatoHelp\n.help", response)
+        self.assertIn("▪️ PotatoTester\n.ping", response)
+        self.assertIn("▪️ Tasks\n.work", response)
+        self.assertIn("▪️ Watcher\nбез команд", response)
+        self.assertTrue(all(options == {"parse_mode": "html"} for options in event.reply_options))
+        entities = [entity for reply in event.replies for entity in telegram_html.parse(reply)[1]]
+        self.assertTrue(any(isinstance(entity, MessageEntityBlockquote) for entity in entities))
+        self.assertTrue(any(isinstance(entity, MessageEntityCustomEmoji) for entity in entities))
+
+    async def test_help_keeps_long_html_pages_complete(self):
+        handler = self.manager.commands["status"]
+        for index in range(120):
+            self.manager.commands[f"long_command_{index:03d}_{'x' * 28}"] = handler
+
+        event = FakeEvent(".help", 100)
+        await self.manager.dispatch_message(event)
+        self.assertGreater(len(event.replies), 1)
+        self.assertTrue(all(len(reply) <= 3800 for reply in event.replies))
+        rendered = "\n".join(telegram_html.parse(reply)[0] for reply in event.replies)
+        self.assertIn(".long_command_000_", rendered)
+        self.assertIn(".long_command_119_", rendered)
+        self.assertTrue(
+            all(
+                any(isinstance(entity, MessageEntityBlockquote) for entity in telegram_html.parse(reply)[1])
+                for reply in event.replies
+            )
+        )
 
     async def test_lm_stages_file_until_restart(self):
         reply = SimpleNamespace(
@@ -423,6 +464,24 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         response = await self.manager.handle_webhook(request)
         self.assertEqual(response.status, 200)
         self.assertEqual(response.text, '{"received": true}')
+
+
+class PresentationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_emoji_falls_back_for_non_premium_account(self):
+        event = FakeEvent(".help", 100)
+        with patch.object(
+            event,
+            "reply",
+            side_effect=[PremiumAccountRequiredError(None), None],
+        ) as reply:
+            await send_html(event, f"{CUSTOM_EMOJI} <b>Potato</b>")
+
+        self.assertEqual(reply.await_count, 2)
+        self.assertNotIn("tg-emoji", reply.await_args_list[1].args[0])
+        self.assertEqual(reply.await_args_list[1].kwargs, {"parse_mode": "html"})
+
+    async def test_dynamic_text_is_escaped(self):
+        self.assertEqual(safe('<script attr="x">&'), "&lt;script attr=&quot;x&quot;&gt;&amp;")
 
 
 class LoginTests(unittest.IsolatedAsyncioTestCase):
