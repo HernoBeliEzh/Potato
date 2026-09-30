@@ -1,6 +1,10 @@
 services:
   potato:
-    build: .
+    image: ${POTATO_IMAGE:-potato-local}
+    build:
+      context: .
+      args:
+        POTATO_BUILD_SHA: ${POTATO_BUILD_SHA:-unknown}
     env_file: .env
     init: true
     restart: unless-stopped
@@ -21,3 +25,4 @@ services:
 
 volumes:
   potato_data:
+    name: ${POTATO_VOLUME_NAME:-potato_potato_data}

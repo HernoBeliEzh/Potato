@@ -57,13 +57,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="potato")
     parser.add_argument("action", choices=("login", "run"))
     parser.add_argument("--qr", action="store_true")
+    parser.add_argument("--account")
     arguments = parser.parse_args()
     if arguments.qr and arguments.action != "login":
         parser.error("--qr доступен только для login")
+    if arguments.account and arguments.action != "login":
+        parser.error("--account доступен только для login")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     try:
-        settings = Settings.from_environment()
+        settings = Settings.from_environment(account_override=arguments.account)
         if arguments.action == "login":
             asyncio.run(login(settings, qr=arguments.qr))
             return 0

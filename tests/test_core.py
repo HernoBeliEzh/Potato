@@ -1,9 +1,10 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
@@ -20,11 +21,13 @@ from telethon.tl.types import (
 from potato.api import Module, command, interval, on_message, webhook
 from potato.__main__ import login
 from potato.application import AccountRuntime
+from potato.i18n import Localizer
 from potato.manager import ModuleManager
 from potato.presentation import CUSTOM_EMOJI, safe, send_html
 from potato.releases import ModuleValidationError, ReleaseManager, inspect_module
 from potato.settings import Settings
 from potato.storage import Storage
+from potato.system_evaluator import calculate
 
 
 MODULE_SOURCE = b"from potato.api import Module, command\nAPI_VERSION = 1\nREQUIRES = ()\nclass Example(Module):\n    @command('example')\n    async def example(self, event):\n        await event.reply('ok')\n"
@@ -108,6 +111,13 @@ class ModuleInspectionTests(unittest.TestCase):
         info = inspect_module(example.name, example.read_bytes())
         self.assertEqual(info.identifier, "hello")
 
+    def test_calculator_accepts_math_and_rejects_code(self):
+        self.assertEqual(calculate("(2 + 3) * 4"), 20)
+        self.assertEqual(calculate("sqrt(81) + abs(-2)"), 11)
+        for source in ("__import__('os')", "x = 2", "[1, 2]", "10 ** 1000", "1 / 0", "round(1, -10**50)"):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                calculate(source)
+
     def test_rejects_invalid_input(self):
         cases = [
             ("../example.py", MODULE_SOURCE),
@@ -140,6 +150,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse((self.releases.pending / "example.py").exists())
         self.assertTrue(self.releases.confirm_activation([]))
 
+    def test_batch_stage_rejects_all_files_on_validation_error(self):
+        self.releases.stage("example.py", MODULE_SOURCE)
+        replacement = MODULE_SOURCE.replace(b"'ok'", b"'new'")
+        with self.assertRaises(ModuleValidationError):
+            self.releases.stage_many([("example.py", replacement), ("bad-name!.py", MODULE_SOURCE)])
+        self.assertEqual((self.releases.pending / "example.py").read_bytes(), MODULE_SOURCE)
+
+    def test_clear_removes_pending_only_modules(self):
+        self.releases.stage("example.py", MODULE_SOURCE)
+        self.assertEqual(self.releases.stage_clear(), 1)
+        self.assertFalse((self.releases.pending / "example.py").exists())
+        self.assertFalse(self.releases.prepare())
+
+    def test_clear_restores_pending_modules_if_queue_write_fails(self):
+        self.releases.stage("example.py", MODULE_SOURCE)
+        with patch.object(self.releases, "_write_removals", side_effect=OSError("failed")):
+            with self.assertRaises(OSError):
+                self.releases.stage_clear()
+        self.assertEqual((self.releases.pending / "example.py").read_bytes(), MODULE_SOURCE)
+
     def test_rejects_core_dependency_conflict(self):
         incompatible = MODULE_SOURCE.replace(b"REQUIRES = ()", b"REQUIRES = ('Telethon==2.0',)")
         with self.assertRaises(ModuleValidationError):
@@ -158,6 +188,18 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.releases.current_release(), previous)
         self.assertEqual((self.releases.active_modules() / "example.py").read_bytes(), MODULE_SOURCE)
         self.assertIn("pip failed", self.releases.consume_error())
+
+    def test_staged_removal_is_applied_only_on_restart(self):
+        self.releases.stage("example.py", MODULE_SOURCE)
+        with patch.object(self.releases, "_install"):
+            self.releases.prepare()
+        self.releases.confirm_activation([])
+        self.releases.stage_remove("example")
+        self.assertTrue((self.releases.active_modules() / "example.py").exists())
+        with patch.object(self.releases, "_install"):
+            self.assertTrue(self.releases.prepare())
+        self.assertFalse((self.releases.active_modules() / "example.py").exists())
+        self.assertTrue(self.releases.confirm_activation([]))
 
     def test_load_failure_rolls_back(self):
         self.releases.stage("example.py", MODULE_SOURCE)
@@ -199,6 +241,33 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.storage.close()
         self.directory.cleanup()
+
+    async def test_language_pack_is_validated_and_persisted(self):
+        localizer = Localizer(self.storage.for_module("default", "__potato_core__"))
+        payload = json.dumps({
+            "locale": "de",
+            "messages": {"greeting.hello": "Hallo {name}"},
+            "phrases": {"Potato работает": "Potato läuft"},
+        }).encode()
+        async def chunks(content):
+            yield content
+
+        response = SimpleNamespace(status=200, content=SimpleNamespace(iter_chunked=lambda _: chunks(payload)))
+        transaction = AsyncMock()
+        transaction.__aenter__.return_value = response
+        http = SimpleNamespace(get=lambda *args, **kwargs: transaction)
+        self.assertEqual(await localizer.install(http, "https://example.com/de.json"), "de")
+        await localizer.set_locale("de")
+        self.assertEqual(localizer.translate("greeting", "hello", {"name": "Ada"}), "Hallo Ada")
+        self.assertEqual(localizer.render_markup("<b>Potato работает</b>"), "<b>Potato läuft</b>")
+        loaded = Localizer(self.storage.for_module("default", "__potato_core__"))
+        await loaded.load()
+        self.assertEqual(loaded.locale, "de")
+        with self.assertRaises(ValueError):
+            await localizer.install(http, "http://example.com/de.json")
+        response.content.iter_chunked = lambda _: chunks(b"x" * 262_145)
+        with self.assertRaisesRegex(ValueError, "256"):
+            await localizer.install(http, "https://example.com/large.json")
 
     async def test_isolates_accounts_and_modules(self):
         first = self.storage.for_module("first", "one")
@@ -252,6 +321,107 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.dispatch_message(outgoing)
         self.assertIn("Potato работает", outgoing.edits[0])
 
+    async def test_public_group_command_requires_address_or_nonick(self):
+        self.manager.username = "potato"
+        ordinary = FakeEvent(".source", 200, outgoing=False)
+        ordinary.chat_id = -100200
+        ordinary.is_group = True
+        await self.manager.dispatch_message(ordinary)
+        self.assertEqual(ordinary.replies, [])
+
+        addressed = FakeEvent(".source@potato", 200, outgoing=False)
+        addressed.chat_id = -100200
+        addressed.is_group = True
+        await self.manager.dispatch_message(addressed)
+        self.assertTrue(addressed.replies)
+
+        setting = FakeEvent(".nonickchat", 100)
+        setting.chat_id = -100200
+        setting.is_group = True
+        await self.manager.dispatch_message(setting)
+        permitted = FakeEvent(".source", 200, outgoing=False)
+        permitted.chat_id = -100200
+        permitted.is_group = True
+        await self.manager.dispatch_message(permitted)
+        self.assertTrue(permitted.replies)
+
+        denied = FakeEvent(".restart", 200, outgoing=False)
+        denied.chat_id = -100200
+        denied.is_group = True
+        await self.manager.dispatch_message(denied)
+        self.assertFalse(self.shutdown.is_set())
+
+    async def test_watcher_rules_filter_messages(self):
+        received = []
+
+        class Observer(Module):
+            @on_message(incoming=True, outgoing=False)
+            async def observe(self, event):
+                received.append(event.chat_id)
+
+        await self.manager._load_class("observer", Observer)
+        await self.manager.dispatch_message(FakeEvent(".watcher observer", 100))
+        first = FakeEvent("hello", 200, outgoing=False)
+        first.chat_id = -100200
+        first.is_group = True
+        await self.manager.dispatch_message(first)
+        self.assertEqual(received, [])
+
+        await self.manager.dispatch_message(FakeEvent(".watcher observer -c", 100))
+        await self.manager.dispatch_message(first)
+        self.assertEqual(received, [-100200])
+
+        private = FakeEvent("hello", 200, outgoing=False)
+        private.is_private = True
+        await self.manager.dispatch_message(private)
+        self.assertEqual(received, [-100200])
+
+        await self.manager.dispatch_message(FakeEvent(".watcher observer -all", 100))
+        await self.manager.dispatch_message(private)
+        self.assertEqual(received, [-100200, private.chat_id])
+
+        blocking = FakeEvent(".watcherbl observer", 100)
+        blocking.chat_id = -100200
+        await self.manager.dispatch_message(blocking)
+        await self.manager.dispatch_message(first)
+        self.assertEqual(received, [-100200, private.chat_id])
+
+    async def test_language_switch_and_optional_module_strings(self):
+        await self.manager.dispatch_message(FakeEvent(".setlang en", 100))
+        status = FakeEvent(".status", 100)
+        await self.manager.dispatch_message(status)
+        self.assertIn("Potato is running", status.edits[0])
+
+        class Greeting(Module):
+            STRINGS = {"ru": {"hello": "Привет"}, "en": {"hello": "Hello"}}
+
+            @command("greeting")
+            async def greeting(self, event):
+                await event.reply(self.context.t("hello"))
+
+        await self.manager._load_class("greeting", Greeting)
+        event = FakeEvent(".greeting", 100)
+        await self.manager.dispatch_message(event)
+        self.assertEqual(event.replies, ["Hello"])
+        saved = await self.storage.for_module("default", "__potato_core__").get("language")
+        self.assertEqual(saved, "en")
+
+    async def test_system_module_count_and_inline_rules(self):
+        self.assertEqual(len(self.manager.system_modules), 15)
+        self.assertNotIn("heroku", self.manager.commands)
+        self.assertNotIn("ch_bot_token", self.manager.commands)
+        event = FakeEvent(".inlinesec status public", 100)
+        await self.manager.dispatch_message(event)
+        self.assertIn("public", event.edits[0])
+        self.assertEqual(self.manager.policy.state["inline_access"], {"status": "public"})
+
+    async def test_english_examples_leave_program_output_intact(self):
+        await self.manager.dispatch_message(FakeEvent(".setlang en", 100))
+        help_event = FakeEvent(".helphide", 100)
+        await self.manager.dispatch_message(help_event)
+        self.assertIn(".helphide module_name", help_event.edits[0])
+        self.assertEqual(self.manager.localizer.render_markup("<pre>нет</pre>"), "<pre>нет</pre>")
+
     async def test_ping_measures_telegram_and_uptime(self):
         event = FakeEvent(". PiNg", 100)
         await self.manager.dispatch_message(event)
@@ -282,9 +452,9 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(". HELP", 100)
         await self.manager.dispatch_message(event)
         response = "\n".join(telegram_html.parse(reply)[0] for reply in event.edits + event.replies)
-        self.assertIn("6 модулей активно", response)
-        self.assertIn("▪️ PotatoHelp: ( help | helphide | support )", response)
-        self.assertIn("▪️ PotatoTester: ( ping )", response)
+        self.assertIn(f"{len(self.manager.modules)} mods available, 0 hidden", response)
+        self.assertIn("▪️ Help: ( help | helphide | support )", response)
+        self.assertIn("▪️ Tester: ( clearlogs | logs | ping | suspend )", response)
         self.assertIn("▪️ Tasks: ( work )", response)
         self.assertIn("▪️ Watcher: ( без команд )", response)
         self.assertEqual(event.replies, [])
@@ -295,16 +465,24 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(isinstance(entity, MessageEntityBold) for entity in entities))
 
     async def test_helphide_changes_visible_modules_without_unloading_them(self):
-        await self.manager.dispatch_message(FakeEvent(".helphide PotatoTester", 100))
+        await self.manager.dispatch_message(FakeEvent(".helphide Tester", 100))
         hidden = FakeEvent(".help", 100)
         await self.manager.dispatch_message(hidden)
-        self.assertNotIn("PotatoTester", hidden.edits[0])
+        self.assertNotIn("▪️ <b>Tester", hidden.edits[0])
+        self.assertIn("1 hidden", hidden.edits[0])
         self.assertIn("potato_tester", self.manager.modules)
 
         await self.manager.dispatch_message(FakeEvent(".helphide potato_tester", 100))
         visible = FakeEvent(".help", 100)
         await self.manager.dispatch_message(visible)
-        self.assertIn("PotatoTester", visible.edits[0])
+        self.assertIn("▪️ <b>Tester", visible.edits[0])
+
+    async def test_helphide_accepts_custom_prefix(self):
+        await self.manager.dispatch_message(FakeEvent(".setprefix !!", 100))
+        await self.manager.dispatch_message(FakeEvent("!!helphide Tester", 100))
+        hidden = FakeEvent("!!help", 100)
+        await self.manager.dispatch_message(hidden)
+        self.assertNotIn("▪️ <b>Tester", hidden.edits[0])
 
     async def test_help_keeps_long_html_pages_complete(self):
         handler = self.manager.commands["status"]
@@ -396,6 +574,110 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             await self.manager._load_class("duplicate", Duplicate)
+
+    async def test_settings_enforce_aliases_blocks_and_toggles(self):
+        await self.manager.dispatch_message(FakeEvent(".addalias state status", 100))
+        alias = FakeEvent(".state", 100)
+        await self.manager.dispatch_message(alias)
+        self.assertIn("Potato работает", alias.edits[0])
+
+        await self.manager.dispatch_message(FakeEvent(".blacklistuser 200", 100))
+        blocked = FakeEvent(".source", 200, outgoing=False)
+        await self.manager.dispatch_message(blocked)
+        self.assertEqual(blocked.replies, [])
+        await self.manager.dispatch_message(FakeEvent(".unblacklistuser 200", 100))
+        allowed = FakeEvent(".source", 200, outgoing=False)
+        await self.manager.dispatch_message(allowed)
+        self.assertTrue(allowed.replies)
+
+        await self.manager.dispatch_message(FakeEvent(".togglecmd ping", 100))
+        disabled = FakeEvent(".ping", 100)
+        await self.manager.dispatch_message(disabled)
+        self.assertEqual(disabled.edits, [])
+        await self.manager.dispatch_message(FakeEvent(".togglecmd ping", 100))
+        restored = FakeEvent(".ping", 100)
+        await self.manager.dispatch_message(restored)
+        self.assertTrue(restored.edits)
+
+    async def test_dot_prefix_remains_after_custom_prefix(self):
+        await self.manager.dispatch_message(FakeEvent(".setprefix !", 100))
+        custom = FakeEvent("! STATUS", 100)
+        dotted = FakeEvent(". STATUS", 100)
+        await self.manager.dispatch_message(custom)
+        await self.manager.dispatch_message(dotted)
+        self.assertTrue(custom.edits)
+        self.assertTrue(dotted.edits)
+
+    async def test_security_owners_groups_and_temporary_rules(self):
+        await self.manager.dispatch_message(FakeEvent(".owneradd 200 CONFIRM", 100))
+        delegated = FakeEvent(".status", 200, outgoing=False)
+        await self.manager.dispatch_message(delegated)
+        self.assertTrue(delegated.replies)
+
+        await self.manager.dispatch_message(FakeEvent(".restart", 200, outgoing=False))
+        self.assertFalse(self.shutdown.is_set())
+        await self.manager.dispatch_message(FakeEvent(".ownerrm 200", 100))
+        denied = FakeEvent(".status", 200, outgoing=False)
+        await self.manager.dispatch_message(denied)
+        self.assertEqual(denied.replies, [])
+
+        await self.manager.dispatch_message(FakeEvent(".newsgroup team", 100))
+        await self.manager.dispatch_message(FakeEvent(".sgroupadd team 200", 100))
+        await self.manager.dispatch_message(FakeEvent(".security status group:team", 100))
+        grouped = FakeEvent(".status", 200, outgoing=False)
+        await self.manager.dispatch_message(grouped)
+        self.assertTrue(grouped.replies)
+        await self.manager.dispatch_message(FakeEvent(".security status default", 100))
+        await self.manager.dispatch_message(FakeEvent(".tsec user 200 status 1h", 100))
+        temporary = FakeEvent(".status", 200, outgoing=False)
+        await self.manager.dispatch_message(temporary)
+        self.assertTrue(temporary.replies)
+        await self.manager.dispatch_message(FakeEvent(".tsecclr CONFIRM", 100))
+        denied_again = FakeEvent(".status", 200, outgoing=False)
+        await self.manager.dispatch_message(denied_again)
+        self.assertEqual(denied_again.replies, [])
+
+    async def test_terminal_runs_only_in_saved_messages(self):
+        command_event = FakeEvent(".terminal echo potato-ready", 100)
+        await self.manager.dispatch_message(command_event)
+        self.assertIn("potato-ready", command_event.edits[0])
+
+        elsewhere = FakeEvent(".terminal echo hidden", 100)
+        elsewhere.chat_id = 999
+        await self.manager.dispatch_message(elsewhere)
+        self.assertIn("только в Избранном", elsewhere.edits[0])
+
+    async def test_suspend_pauses_commands_and_can_resume(self):
+        await self.manager.dispatch_message(FakeEvent(".suspend 30", 100))
+        paused = FakeEvent(".status", 100)
+        await self.manager.dispatch_message(paused)
+        self.assertEqual(paused.edits, [])
+        await self.manager.dispatch_message(FakeEvent(".suspend 0", 100))
+        resumed = FakeEvent(".status", 100)
+        await self.manager.dispatch_message(resumed)
+        self.assertTrue(resumed.edits)
+
+    async def test_config_reads_and_writes_declared_values(self):
+        class Configurable(Module):
+            CONFIG = {"enabled": False, "label": "original", "api_token": "secret"}
+
+        await self.manager._load_class("configurable", Configurable)
+        before = FakeEvent(".config Configurable", 100)
+        await self.manager.dispatch_message(before)
+        self.assertIn("enabled", before.edits[0])
+        self.assertNotIn("secret</code>", before.edits[0])
+
+        update = FakeEvent(".cfg Configurable enabled true", 100)
+        await self.manager.dispatch_message(update)
+        self.assertIn("сохранён", update.edits[0])
+        value = await self.manager.modules["configurable"].context.storage.get("config:enabled")
+        self.assertIs(value, True)
+
+    async def test_python_evaluator_returns_expression_result(self):
+        event = FakeEvent(".e 1 + 2", 100)
+        event.chat_id = 999
+        await self.manager.dispatch_message(event)
+        self.assertIn("<pre>3", event.edits[0])
 
     async def test_dispatches_messages_tasks_and_webhooks(self):
         seen = []
@@ -574,6 +856,29 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inline_failure_keeps_userbot_running_and_closes_service(self):
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        storage = Storage(root / "state.sqlite")
+        await storage.open()
+        client = FakeClient()
+        inline = SimpleNamespace(start=AsyncMock(return_value=False), close=AsyncMock(), error="BotFather недоступен", ready=False)
+        try:
+            async with ClientSession() as http:
+                account = AccountRuntime(Settings("default", 1, "hash", root, "127.0.0.1", 8080, ""), ReleaseManager(root), storage, http)
+                with patch("potato.application.TelegramClient", return_value=client), patch("potato.application.InlineBot", return_value=inline):
+                    await account.start()
+                self.assertTrue(client.is_connected())
+                self.assertEqual(len(client.handlers), 1)
+                self.assertIn(("me", "Potato Inline: BotFather недоступен"), client.messages)
+                account.shutdown.set()
+                await asyncio.wait_for(account.wait(), timeout=1)
+                await account.close()
+                inline.close.assert_awaited_once()
+        finally:
+            await storage.close()
+            directory.cleanup()
+
     async def test_account_starts_and_stops_on_restart_request(self):
         directory = tempfile.TemporaryDirectory()
         root = Path(directory.name)
@@ -585,7 +890,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with ClientSession() as http:
                 account = AccountRuntime(settings, releases, storage, http)
-                with patch("potato.application.TelegramClient", return_value=client):
+                with patch("potato.application.TelegramClient", return_value=client), patch("potato.application.InlineBot.start", new=AsyncMock(return_value=True)):
                     await account.start()
                 self.assertTrue(client.is_connected())
                 self.assertEqual(len(client.handlers), 1)

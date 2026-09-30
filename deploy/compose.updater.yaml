@@ -1,0 +1,6 @@
+services:
+  potato:
+    environment:
+      POTATO_UPDATE_DIR: /control
+    volumes:
+      - /opt/potato-updater/control:/control

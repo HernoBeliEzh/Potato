@@ -9,15 +9,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md requirements.lock LICENSE ./
-COPY potato ./potato
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y gcc g++ golang-go rustc nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r requirements.lock && \
-    pip install --no-cache-dir --no-deps . && \
-    groupadd --system potato && \
-    useradd --system --gid potato --home-dir /data potato && \
+COPY requirements.lock ./
+
+RUN \
+    pip install --no-cache-dir -r requirements.lock && \
+    groupadd --system --gid 999 potato && \
+    useradd --system --uid 999 --gid potato --home-dir /data potato && \
     mkdir -p /data && \
     chown potato:potato /data
+
+COPY pyproject.toml README.md LICENSE ./
+COPY potato ./potato
+RUN pip install --no-cache-dir --no-deps .
+
+ARG POTATO_BUILD_SHA=unknown
+ENV POTATO_BUILD_SHA=${POTATO_BUILD_SHA}
 
 USER potato
 

@@ -7,8 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+import sqlite3
 import uuid
-from contextlib import suppress
+from contextlib import suppress, closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,24 +21,25 @@ from potato import API_VERSION
 
 MAX_MODULE_SIZE = 1_048_576
 MODULE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\.py\Z")
-RESERVED_MODULES = {"system", "module_admin", "potato_help", "potato_tester"}
+RESERVED_MODULES = {"system", "module_admin", "potato_help", "potato_tester", "settings", "potato_settings", "potato_security", "potato_terminal", "potato_config", "potato_evaluator", "potato_translator", "potato_translations", "api_limiter", "potato_accounts"}
 
 
 @dataclass(frozen=True)
 class ModuleInfo:
     identifier: str
     requirements: tuple[str, ...]
+    kind: str = "potato"
 
 
 class ModuleValidationError(ValueError):
     __slots__ = ()
 
 
-def inspect_module(filename: str, content: bytes) -> ModuleInfo:
+def inspect_module(filename: str, content: bytes, *, allow_heroku: bool = False) -> ModuleInfo:
     if not MODULE_NAME.fullmatch(filename):
         raise ModuleValidationError("Имя файла должно иметь вид name.py: строчные буквы, цифры и _")
     identifier = filename[:-3]
-    if identifier in RESERVED_MODULES:
+    if identifier in RESERVED_MODULES or identifier == "potato_backups":
         raise ModuleValidationError("Это имя зарезервировано встроенным модулем")
     if not content or len(content) > MAX_MODULE_SIZE:
         raise ModuleValidationError("Размер модуля должен быть от 1 байта до 1 МиБ")
@@ -81,8 +83,27 @@ def inspect_module(filename: str, content: bytes) -> ModuleInfo:
                 raise ModuleValidationError("REQUIRES должен быть списком строк")
             requirements = tuple(declared)
 
+    kind = "potato"
     if not version_found:
-        raise ModuleValidationError(f"Укажите API_VERSION = {API_VERSION}")
+        heroku = any(
+            isinstance(statement, ast.ImportFrom) and any(alias.name == "loader" for alias in statement.names)
+            or isinstance(statement, ast.Import) and any(alias.name.endswith(".loader") for alias in statement.names)
+            for statement in tree.body
+        )
+        if not heroku:
+            raise ModuleValidationError(f"Укажите API_VERSION = {API_VERSION}")
+        if not allow_heroku:
+            raise ModuleValidationError("Включите поддержку Heroku в настройках Potato-бота")
+        from potato.heroku import validate_source
+        try:
+            validate_source(tree)
+        except ValueError as error:
+            raise ModuleValidationError(str(error)) from error
+        kind = "heroku"
+        if not requirements_found:
+            declared = re.search(r"^\s*#\s*requires:\s*(.+)$", source, re.MULTILINE | re.IGNORECASE)
+            if declared:
+                requirements = tuple(declared[1].split())
     classes = [
         statement
         for statement in tree.body
@@ -104,7 +125,7 @@ def inspect_module(filename: str, content: bytes) -> ModuleInfo:
         if requirement.url is not None:
             raise ModuleValidationError("Зависимости по прямым URL не поддерживаются")
 
-    return ModuleInfo(identifier, requirements)
+    return ModuleInfo(identifier, requirements, kind)
 
 
 class ReleaseManager:
@@ -112,24 +133,115 @@ class ReleaseManager:
         self.data_dir = data_dir
         self.root = data_dir / "modules"
         self.pending = self.root / "pending"
+        self.pending_removals = self.root / "pending_removals.json"
         self.releases = self.root / "releases"
         self.failed = self.root / "failed"
         self.pointer = self.root / "current"
         self.probation = self.root / "probation"
         self.error_file = self.root / "activation_error"
+        self.allow_heroku = False
+        database = data_dir / "state.sqlite"
+        if database.exists():
+            account_file = data_dir / "active_account"
+            account = account_file.read_text().strip() if account_file.exists() else os.getenv("POTATO_ACCOUNT", "default")
+            with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+                row = connection.execute("SELECT value FROM values_store WHERE account=? AND module=? AND key=?", (account, "__potato_services__", "state")).fetchone()
+                if row:
+                    self.allow_heroku = bool(json.loads(row[0]).get("heroku", False))
         configured = os.getenv("POTATO_REQUIREMENTS_FILE")
         self.requirements_file = requirements_file or (
             Path(configured) if configured else Path.cwd() / "requirements.lock"
         )
 
     def stage(self, filename: str, content: bytes) -> ModuleInfo:
-        info = inspect_module(filename, content)
+        info = inspect_module(filename, content, allow_heroku=self.allow_heroku)
         self._check_core_requirements(info.requirements)
         self.pending.mkdir(parents=True, exist_ok=True)
         temporary = self.pending / f".{uuid.uuid4().hex}.tmp"
         temporary.write_bytes(content)
         os.replace(temporary, self.pending / filename)
+        removals = self._read_removals()
+        if info.identifier in removals:
+            removals.remove(info.identifier)
+            self._write_removals(removals)
         return info
+
+    def stage_many(self, modules: list[tuple[str, bytes]]) -> list[ModuleInfo]:
+        infos = [inspect_module(filename, content, allow_heroku=self.allow_heroku) for filename, content in modules]
+        identifiers = {info.identifier for info in infos}
+        if len(identifiers) != len(infos):
+            raise ModuleValidationError("В каталоге есть повторяющиеся имена модулей")
+        for info in infos:
+            self._check_core_requirements(info.requirements)
+        candidate = self.root / f".{uuid.uuid4().hex}.pending"
+        backup = self.root / f".{uuid.uuid4().hex}.backup"
+        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            candidate.mkdir()
+            if self.pending.exists():
+                shutil.copytree(self.pending, candidate, dirs_exist_ok=True)
+            for filename, content in modules:
+                (candidate / filename).write_bytes(content)
+            removals = self._read_removals()
+            if self.pending.exists():
+                os.replace(self.pending, backup)
+            try:
+                os.replace(candidate, self.pending)
+                if identifiers & removals:
+                    self._write_removals(removals - identifiers)
+            except Exception:
+                if backup.exists():
+                    shutil.rmtree(self.pending, ignore_errors=True)
+                    os.replace(backup, self.pending)
+                else:
+                    shutil.rmtree(self.pending, ignore_errors=True)
+                raise
+        finally:
+            shutil.rmtree(candidate, ignore_errors=True)
+        shutil.rmtree(backup, ignore_errors=True)
+        return infos
+
+    def stage_clear(self) -> int:
+        active = self.active_modules()
+        active_names = set() if active is None else {path.stem for path in active.glob("*.py")}
+        pending_paths = list(self.pending.glob("*.py")) if self.pending.exists() else []
+        backup = self.root / f".{uuid.uuid4().hex}.backup"
+        if self.pending.exists():
+            os.replace(self.pending, backup)
+        try:
+            self._write_removals(active_names)
+        except Exception:
+            if backup.exists():
+                os.replace(backup, self.pending)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
+        return len(active_names | {path.stem for path in pending_paths})
+
+    def stage_remove(self, identifier: str) -> None:
+        if not MODULE_NAME.fullmatch(f"{identifier}.py") or identifier in RESERVED_MODULES:
+            raise ModuleValidationError("Недопустимое имя модуля")
+        active = self.active_modules()
+        present = active is not None and (active / f"{identifier}.py").is_file()
+        pending = (self.pending / f"{identifier}.py").is_file()
+        if not present and not pending:
+            raise ModuleValidationError("Модуль не установлен и не ожидает установки")
+        removals = self._read_removals()
+        removals.add(identifier)
+        self._write_removals(removals)
+
+    def _read_removals(self) -> set[str]:
+        if not self.pending_removals.exists():
+            return set()
+        data = json.loads(self.pending_removals.read_text(encoding="utf-8"))
+        if not isinstance(data, list) or not all(isinstance(name, str) and MODULE_NAME.fullmatch(f"{name}.py") for name in data):
+            raise RuntimeError("Некорректный список удаляемых модулей")
+        return set(data)
+
+    def _write_removals(self, removals: set[str]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        temporary = self.root / f".{uuid.uuid4().hex}.removals"
+        temporary.write_text(json.dumps(sorted(removals)), encoding="utf-8")
+        os.replace(temporary, self.pending_removals)
 
     def current_release(self) -> Path | None:
         if not self.pointer.exists():
@@ -157,7 +269,8 @@ class ReleaseManager:
     def prepare(self) -> bool:
         self._recover_interrupted_activation()
         pending_files = sorted(self.pending.glob("*.py")) if self.pending.exists() else []
-        if not pending_files:
+        removals = self._read_removals()
+        if not pending_files and not removals:
             return False
 
         self.releases.mkdir(parents=True, exist_ok=True)
@@ -174,10 +287,12 @@ class ReleaseManager:
                     shutil.copy2(path, candidate_modules / path.name)
             for path in pending_files:
                 shutil.copy2(path, candidate_modules / path.name)
+            for name in removals:
+                (candidate_modules / f"{name}.py").unlink(missing_ok=True)
 
             requirements: list[str] = []
             for path in sorted(candidate_modules.glob("*.py")):
-                info = inspect_module(path.name, path.read_bytes())
+                info = inspect_module(path.name, path.read_bytes(), allow_heroku=True)
                 requirements.extend(info.requirements)
             self._check_core_requirements(requirements)
             self._install(candidate, requirements)
@@ -188,6 +303,7 @@ class ReleaseManager:
             for path in pending_files:
                 if path.exists():
                     os.replace(path, self.failed / f"{identifier}_{path.name}")
+            self.pending_removals.unlink(missing_ok=True)
             self.error_file.write_text(str(error), encoding="utf-8")
             return False
 
@@ -209,6 +325,7 @@ class ReleaseManager:
         for path in pending_files:
             with suppress(OSError):
                 path.unlink(missing_ok=True)
+        self.pending_removals.unlink(missing_ok=True)
         with suppress(OSError):
             self.error_file.unlink(missing_ok=True)
         return True

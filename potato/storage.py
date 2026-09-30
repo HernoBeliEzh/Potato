@@ -31,6 +31,14 @@ class Storage:
     def for_module(self, account: str, module: str) -> "ModuleStorage":
         return ModuleStorage(self, account, module)
 
+    async def clear_account(self, account: str) -> None:
+        connection = self.connection
+        if connection is None:
+            raise RuntimeError("Storage is closed")
+        async with self.write_lock:
+            await connection.execute("DELETE FROM values_store WHERE account = ?", (account,))
+            await connection.commit()
+
 
 class ModuleStorage:
     def __init__(self, storage: Storage, account: str, module: str):
@@ -48,6 +56,16 @@ class ModuleStorage:
         ) as cursor:
             row = await cursor.fetchone()
         return default if row is None else json.loads(row[0])
+
+    async def all(self) -> dict[str, Any]:
+        connection = self.storage.connection
+        if connection is None:
+            raise RuntimeError("Storage is closed")
+        async with connection.execute(
+            "SELECT key, value FROM values_store WHERE account = ? AND module = ?",
+            (self.account, self.module),
+        ) as cursor:
+            return {key: json.loads(value) for key, value in await cursor.fetchall()}
 
     async def set(self, key: str, value: Any) -> None:
         connection = self.storage.connection
@@ -70,5 +88,16 @@ class ModuleStorage:
             await connection.execute(
                 "DELETE FROM values_store WHERE account = ? AND module = ? AND key = ?",
                 (self.account, self.module, key),
+            )
+            await connection.commit()
+
+    async def clear(self) -> None:
+        connection = self.storage.connection
+        if connection is None:
+            raise RuntimeError("Storage is closed")
+        async with self.storage.write_lock:
+            await connection.execute(
+                "DELETE FROM values_store WHERE account = ? AND module = ?",
+                (self.account, self.module),
             )
             await connection.commit()

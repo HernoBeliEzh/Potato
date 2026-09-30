@@ -15,8 +15,13 @@ class Settings:
     source_url: str
 
     @classmethod
-    def from_environment(cls) -> "Settings":
-        account = os.getenv("POTATO_ACCOUNT", "default")
+    def from_environment(cls, *, account_override: str | None = None) -> "Settings":
+        data_dir = Path(os.getenv("POTATO_DATA_DIR", "./data")).resolve()
+        active_account = data_dir / "active_account"
+        account = account_override or (
+            active_account.read_text(encoding="ascii").strip()
+            if active_account.exists() else os.getenv("POTATO_ACCOUNT", "default")
+        )
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", account):
             raise ValueError("POTATO_ACCOUNT must contain 1–32 lowercase letters, digits, _ or -")
 
@@ -33,7 +38,7 @@ class Settings:
             account=account,
             api_id=api_id,
             api_hash=api_hash,
-            data_dir=Path(os.getenv("POTATO_DATA_DIR", "./data")).resolve(),
+            data_dir=data_dir,
             http_host=os.getenv("POTATO_HTTP_HOST", "127.0.0.1"),
             http_port=http_port,
             source_url=os.getenv("POTATO_SOURCE_URL", ""),

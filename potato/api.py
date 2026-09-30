@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from aiohttp import ClientSession
 from telethon import TelegramClient
@@ -17,6 +17,7 @@ class CommandSpec:
     name: str
     owner_only: bool
     aliases: tuple[str, ...] = ()
+    primary_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,16 +50,34 @@ class ModuleContext:
     manager: ModuleManager
     source_url: str
     request_restart: Callable[[], None]
+    module_id: str = ""
+    localizer: Any = None
+    inline: Any = None
+
+    def t(self, key: str, **values: Any) -> str:
+        if self.localizer is None:
+            return key
+        return self.localizer.translate(self.module_id, key, values)
 
 
 class Module:
+    CONFIG: dict[str, Any] = {}
+    STRINGS: dict[str, dict[str, str]] = {}
+    DISPLAY_NAME = ""
+
     def __init__(self, context: ModuleContext):
         self.context = context
 
 
-def command(name: str, *, owner_only: bool = True, aliases: tuple[str, ...] = ()):
+def command(
+    name: str,
+    *,
+    owner_only: bool = True,
+    aliases: tuple[str, ...] = (),
+    primary_only: bool = False,
+):
     def decorate(callback):
-        callback.__potato_command__ = CommandSpec(name, owner_only, aliases)
+        callback.__potato_command__ = CommandSpec(name, owner_only, aliases, primary_only)
         return callback
 
     return decorate
@@ -67,6 +86,20 @@ def command(name: str, *, owner_only: bool = True, aliases: tuple[str, ...] = ()
 def on_message(*, incoming: bool = True, outgoing: bool = False, pattern: str | None = None):
     def decorate(callback):
         callback.__potato_message__ = MessageSpec(incoming, outgoing, pattern)
+        return callback
+
+    return decorate
+
+
+def inline_command(
+    name: str,
+    *,
+    owner_only: bool = True,
+    aliases: tuple[str, ...] = (),
+    primary_only: bool = False,
+):
+    def decorate(callback):
+        callback.__potato_inline__ = CommandSpec(name, owner_only, aliases, primary_only)
         return callback
 
     return decorate
