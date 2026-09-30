@@ -7,6 +7,7 @@ from contextvars import ContextVar
 import logging
 
 from telethon import TelegramClient, functions
+from telethon.errors import RPCError, MultiError
 
 
 API_PRIORITY = ContextVar("potato_api_priority", default=False)
@@ -53,6 +54,18 @@ class ProtectedTelegramClient(TelegramClient):
         self.api_request_seconds = 0.0
 
     async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+        if isinstance(request, (list, tuple)):
+            results, errors = [], []
+            for item in request:
+                try:
+                    results.append(await self._call(sender, item, ordered, flood_sleep_threshold))
+                    errors.append(None)
+                except RPCError as error:
+                    results.append(None)
+                    errors.append(error)
+            if any(errors):
+                raise MultiError(errors, results, list(request))
+            return results
         policy = self.policy
         if policy is not None and policy.state.get("api_protection_enabled", True):
             if time.time() >= policy.state.get("api_protection_suspended_until", 0):

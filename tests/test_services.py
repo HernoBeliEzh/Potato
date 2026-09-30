@@ -11,7 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientSession
-from telethon import functions
+from telethon import functions, TelegramClient
+from telethon.errors import FloodWaitError, MultiError
+from telethon.sessions import MemorySession
+from telethon.tl.types import InputPeerSelf
 
 from potato.backups import MAX_BACKUP_SIZE, create_backup, read_backup
 from potato.inline import InlineBot
@@ -20,7 +23,7 @@ from potato.releases import ModuleValidationError, ReleaseManager, inspect_modul
 from potato.services import AccountServices
 from potato.settings import Settings
 from potato.storage import Storage
-from potato.telegram_client import RequestBudget
+from potato.telegram_client import RequestBudget, ProtectedTelegramClient
 from potato.updates import UpdateMonitor
 
 
@@ -77,6 +80,42 @@ class BackupTests(unittest.TestCase):
 
 
 class BudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_service_sync_does_not_take_command_budget(self):
+        client = ProtectedTelegramClient(MemorySession(), 1, "hash")
+        client.policy = SimpleNamespace(state={})
+        client.budget.acquire = AsyncMock(return_value=0)
+        with patch.object(TelegramClient, "_call", new_callable=AsyncMock):
+            await client._call(None, functions.updates.GetStateRequest())
+            client.budget.acquire.assert_not_awaited()
+            await client._call(None, functions.messages.SendMessageRequest(InputPeerSelf(), "answer"))
+            client.budget.acquire.assert_awaited_once()
+
+    async def test_batches_are_sent_as_budget_is_acquired(self):
+        client = ProtectedTelegramClient(MemorySession(), 1, "hash")
+        client.policy = SimpleNamespace(state={})
+        client.budget = RequestBudget(window=0.04, total=3, ordinary=2)
+        sent = []
+        async def send(sender, request, ordered, threshold):
+            sent.append(time.monotonic())
+            return request.message
+        requests = [functions.messages.SendMessageRequest(InputPeerSelf(), str(index)) for index in range(3)]
+        with patch.object(TelegramClient, "_call", side_effect=send):
+            self.assertEqual(await client._call(None, requests), ["0", "1", "2"])
+        self.assertGreater(sent[2] - sent[0], 0.025)
+
+    async def test_batch_preserves_rpc_errors_and_partial_results(self):
+        client = ProtectedTelegramClient(MemorySession(), 1, "hash")
+        requests = [functions.messages.SendMessageRequest(InputPeerSelf(), "ok"), functions.messages.SendMessageRequest(InputPeerSelf(), "blocked")]
+        async def send(sender, request, ordered, threshold):
+            if request.message == "blocked":
+                raise FloodWaitError(request, capture=10)
+            return request.message
+        with patch.object(TelegramClient, "_call", side_effect=send):
+            with self.assertRaises(MultiError) as raised:
+                await client._call(None, requests)
+        self.assertEqual(raised.exception.results, ["ok", None])
+        self.assertIsInstance(raised.exception.exceptions[1], FloodWaitError)
+
     async def test_ordinary_load_keeps_priority_reserve(self):
         budget = RequestBudget(window=0.15, total=3, ordinary=2)
         await budget.acquire()
